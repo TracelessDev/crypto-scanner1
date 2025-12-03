@@ -28,13 +28,13 @@ async def cmd_start(message: types.Message):
     await get_user_settings(message.from_user.id) 
     await message.answer(
         "<b>Impulse Screener</b>\n\n"
-        "Система мониторинга волатильности.\n"
-        "Настройте параметры для начала работы.",
+        "Терминал мониторинга запущен.\n"
+        "Настрой фильтры и выбери биржи.",
         reply_markup=get_main_menu(),
         parse_mode="HTML"
     )
 
-# --- SETTINGS MAIN ---
+# --- ГЛАВНЫЕ НАСТРОЙКИ ---
 @router.message(F.text == "⚙️ Настройки")
 async def settings_main_msg(message: types.Message):
     await show_settings_menu(message)
@@ -49,7 +49,7 @@ async def show_settings_menu(message_or_cb):
 
     user = await get_user_settings(user_id)
     
-    sig_map = {'BOTH': 'Long/Short', 'PUMP': 'Long Only', 'DUMP': 'Short Only'}
+    sig_map = {'BOTH': 'Лонг и Шорт', 'PUMP': 'Только Лонг 🟢', 'DUMP': 'Только Шорт 🔴'}
     current_sig = sig_map.get(user['signal_type'], 'BOTH')
 
     text = "<b>⚙️ Конфигурация</b>"
@@ -58,11 +58,10 @@ async def show_settings_menu(message_or_cb):
     kb.button(text=f"⏱ Таймфрейм: {user['interval']}м", callback_data="menu_interval")
     kb.button(text=f"⚡️ Порог: {user['threshold']}%", callback_data="menu_threshold")
     
-    # Кнопка ведет в подменю RSI
     rsi_status = "Вкл" if user['rsi_enabled'] else "Выкл"
     kb.button(text=f"📈 Настройки RSI ({rsi_status})", callback_data="menu_rsi_main")
     
-    kb.button(text=f"👀 Данные", callback_data="menu_display")
+    kb.button(text=f"👀 Состав сигнала", callback_data="menu_display")
     kb.button(text=f"🚦 Режим: {current_sig}", callback_data="toggle_sig_type")
     
     trend_status = "Вкл" if user['filter_24h_enabled'] else "Выкл"
@@ -79,28 +78,55 @@ async def show_settings_menu(message_or_cb):
 async def back_to_main(cb: types.CallbackQuery):
     await show_settings_menu(cb)
 
-# --- RSI SUB-MENU ---
+# --- МЕНЮ ОТОБРАЖЕНИЯ (ИСПРАВЛЕНО) ---
+@router.callback_query(F.data == "menu_display")
+async def menu_display(cb: types.CallbackQuery):
+    user = await get_user_settings(cb.from_user.id)
+    kb = InlineKeyboardBuilder()
+    
+    # ТЕПЕРЬ ВСЕ НА РУССКОМ
+    toggles = [
+        ("show_imbalance", "Дисбаланс стакана"),
+        ("show_funding", "Ставка фандинга"),
+        ("show_vol24", "Объем 24ч"),
+        ("show_listing", "Дата листинга"),
+        ("show_hashtag", "Хэштег (#)")
+    ]
+    
+    for col, label in toggles:
+        # ТЕПЕРЬ НОРМАЛЬНЫЕ КРЕСТЫ И ГАЛОЧКИ
+        status = "✅" if user[col] else "❌"
+        kb.button(text=f"{status} {label}", callback_data=f"toggle_disp_{col}")
+        
+    kb.button(text="🔙 Назад", callback_data="settings_main")
+    kb.adjust(1)
+    
+    await refresh_menu(cb, "<b>👀 Данные внутри сигнала</b>\nЧто показывать в карточке:", kb.as_markup())
+
+@router.callback_query(F.data.startswith("toggle_disp_"))
+async def toggle_display(cb: types.CallbackQuery):
+    col = cb.data.split("toggle_disp_")[1]
+    user = await get_user_settings(cb.from_user.id)
+    await update_user_setting(cb.from_user.id, col, not user[col])
+    await menu_display(cb)
+
+# --- RSI МЕНЮ ---
 @router.callback_query(F.data == "menu_rsi_main")
 async def menu_rsi_main(cb: types.CallbackQuery):
     user = await get_user_settings(cb.from_user.id)
     
     text = (
         "<b>📈 Конфигурация RSI</b>\n\n"
-        "Настройте индикатор перекупленности/перепроданности.\n"
-        "Сигналы будут игнорироваться, если RSI выходит за эти рамки."
+        "Фильтр перекупленности/перепроданности."
     )
     
     kb = InlineKeyboardBuilder()
     
-    # Toggle
     status = "✅ АКТИВЕН" if user['rsi_enabled'] else "❌ ВЫКЛЮЧЕН"
     kb.button(text=status, callback_data="toggle_rsi_bool")
     
     if user['rsi_enabled']:
-        # TF Cycle
         kb.button(text=f"Таймфрейм: {user.get('rsi_timeframe', '5m')}", callback_data="cycle_rsi_tf")
-        
-        # Limits
         kb.button(text=f"Макс. для Лонга: < {user['rsi_pump_limit']}", callback_data="input_rsi_pump")
         kb.button(text=f"Мин. для Шорта: > {user['rsi_dump_limit']}", callback_data="input_rsi_dump")
         
@@ -127,7 +153,6 @@ async def cycle_rsi_tf(cb: types.CallbackQuery):
     await update_user_setting(cb.from_user.id, "rsi_timeframe", new_val)
     await menu_rsi_main(cb)
 
-# Inputs for RSI
 @router.callback_query(F.data == "input_rsi_pump")
 async def input_rsi_pump(cb: types.CallbackQuery, state: FSMContext):
     await cb.message.answer("Введите Макс. RSI для Лонга (например 70):")
@@ -140,8 +165,8 @@ async def finish_rsi_pump(message: types.Message, state: FSMContext):
         val = int(message.text)
         if 1 <= val <= 99:
             await update_user_setting(message.from_user.id, "rsi_pump_limit", val)
-            await message.answer(f"✅ Фильтр обновлен: RSI < {val}")
-        else: await message.answer("❌ От 1 до 99")
+            await message.answer(f"✅ RSI фильтр Лонга: < {val}")
+        else: await message.answer("❌ Введите от 1 до 99")
     except: await message.answer("❌ Число")
     await state.clear()
     await show_settings_menu(message)
@@ -158,13 +183,13 @@ async def finish_rsi_dump(message: types.Message, state: FSMContext):
         val = int(message.text)
         if 1 <= val <= 99:
             await update_user_setting(message.from_user.id, "rsi_dump_limit", val)
-            await message.answer(f"✅ Фильтр обновлен: RSI > {val}")
-        else: await message.answer("❌ От 1 до 99")
+            await message.answer(f"✅ RSI фильтр Шорта: > {val}")
+        else: await message.answer("❌ Введите от 1 до 99")
     except: await message.answer("❌ Число")
     await state.clear()
     await show_settings_menu(message)
 
-# --- EXCHANGES ---
+# --- БИРЖИ ---
 @router.message(F.text == "📊 Источники")
 async def menu_exchanges(message: types.Message):
     await show_exchange_menu(message)
@@ -184,12 +209,12 @@ async def show_exchange_menu(message_or_cb):
     kb = InlineKeyboardBuilder()
     for ex in ["binance", "bybit", "mexc"]:
         is_active = ex in active_list
-        status = "☑️" if is_active else "⬜️"
+        status = "✅" if is_active else "❌"
         kb.button(text=f"{status} {ex.capitalize()}", callback_data=f"toggle_ex_{ex}")
     
     kb.adjust(1)
     
-    text = "<b>🏦 Источники данных</b>"
+    text = "<b>🏦 Источники данных</b>\nОтметьте биржи:"
     
     if isinstance(message_or_cb, types.CallbackQuery):
         await refresh_menu(message_or_cb, text, kb.as_markup())
@@ -215,13 +240,7 @@ async def toggle_exchange(cb: types.CallbackQuery):
     await update_user_setting(cb.from_user.id, "exchanges", json.dumps(current_list))
     await show_exchange_menu(cb)
 
-# --- OTHER MENUS (Interval, Threshold, etc - Same logic) ---
-# ... (Остальные хендлеры для интервала, порога и дисплея остаются как в прошлом коде, 
-# только проверь, чтобы они были подключены. Я сократил для читаемости, 
-# если нужно - продублирую, но они не менялись по логике, только текст заголовка)
-# Важно добавить хендлеры для menu_interval, menu_threshold, menu_display
-# Ниже полные версии для копипаста:
-
+# --- ОСТАЛЬНЫЕ МЕНЮ (ИНТЕРВАЛ, ПОРОГ) ---
 @router.callback_query(F.data == "menu_interval")
 async def menu_interval(cb: types.CallbackQuery):
     user = await get_user_settings(cb.from_user.id)
@@ -293,31 +312,6 @@ async def finish_thr(message: types.Message, state: FSMContext):
     except: pass
     await state.clear()
     await show_settings_menu(message)
-
-@router.callback_query(F.data == "menu_display")
-async def menu_display(cb: types.CallbackQuery):
-    user = await get_user_settings(cb.from_user.id)
-    kb = InlineKeyboardBuilder()
-    toggles = [
-        ("show_imbalance", "Imbalance"),
-        ("show_funding", "Funding"),
-        ("show_vol24", "Volume 24h"),
-        ("show_listing", "Listing Date"),
-        ("show_hashtag", "Hashtag #")
-    ]
-    for col, label in toggles:
-        status = "☑️" if user[col] else "⬜️"
-        kb.button(text=f"{status} {label}", callback_data=f"toggle_disp_{col}")
-    kb.button(text="🔙 Назад", callback_data="settings_main")
-    kb.adjust(1)
-    await refresh_menu(cb, "<b>👀 Данные</b>", kb.as_markup())
-
-@router.callback_query(F.data.startswith("toggle_disp_"))
-async def toggle_display(cb: types.CallbackQuery):
-    col = cb.data.split("toggle_disp_")[1]
-    user = await get_user_settings(cb.from_user.id)
-    await update_user_setting(cb.from_user.id, col, not user[col])
-    await menu_display(cb)
 
 @router.callback_query(F.data == "toggle_sig_type")
 async def toggle_sig_type(cb: types.CallbackQuery):
