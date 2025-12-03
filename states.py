@@ -4,5 +4,5 @@ class SettingsState(StatesGroup):
     waiting_for_interval = State()
     waiting_for_threshold = State()
     waiting_for_rsi_period = State()
-    waiting_for_rsi_pump = State()
-    waiting_for_rsi_dump = State()
+    waiting_for_rsi_pump = State() # <--- NEW
+    waiting_for_rsi_dump = State() # <--- NEW

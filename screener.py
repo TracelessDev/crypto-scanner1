@@ -3,6 +3,7 @@ import ccxt.async_support as ccxt
 import pandas as pd
 import numpy as np
 import logging
+import json
 from datetime import datetime, timedelta
 from database import get_all_users
 
@@ -26,7 +27,7 @@ class MarketEngine:
         self.exchanges['binance'] = ccxt.binance(options)
         self.exchanges['bybit'] = ccxt.bybit(options)
         self.exchanges['mexc'] = ccxt.mexc(options)
-        logger.info("Коннекторы бирж инициализированы.")
+        logger.info("Core Systems Online.")
 
     async def close_exchanges(self):
         for name, exchange in self.exchanges.items():
@@ -36,7 +37,7 @@ class MarketEngine:
         try:
             exchange = self.exchanges[exchange_name]
             tickers = await exchange.fetch_tickers()
-            if not tickers: raise ValueError("Нет данных")
+            if not tickers: raise ValueError("No Data")
             return exchange_name, tickers
         except Exception:
             return exchange_name, {}
@@ -49,21 +50,11 @@ class MarketEngine:
                 if not PRICE_BUFFER[exc][sym]: del PRICE_BUFFER[exc][sym]
 
     async def process_market_data(self):
-        logger.info("Сканер запущен. Мониторинг рынка активен.")
-        last_debug_print = datetime.now()
-
+        logger.info("Market Monitor Active.")
+        
         while self.running:
             loop_start = datetime.now()
             
-            # Лог состояния раз в минуту (чтобы ты видел, что настройки применились)
-            if (datetime.now() - last_debug_print).total_seconds() > 60:
-                users_debug = await get_all_users()
-                print(f"\n[SYSTEM STATUS] Активных пользователей: {len(users_debug)}")
-                for u in users_debug:
-                    print(f"ID: {u['user_id']} | Source: {u.get('active_exchange')} | Trigger: {u['threshold']}% ({u['interval']}m)")
-                print("-" * 30)
-                last_debug_print = datetime.now()
-
             try:
                 results = await asyncio.gather(*[self.fetch_tickers_safe(name) for name in self.exchanges])
             except Exception:
@@ -92,7 +83,13 @@ class MarketEngine:
                     history = PRICE_BUFFER[ex][sym]
                     curr_price = history[loop_start]
                     
-                    intervals_needed = set(u['interval'] for u in users if u.get('active_exchange') == ex)
+                    # Оптимизация: собираем нужные интервалы
+                    intervals_needed = set()
+                    for u in users:
+                        try: allowed = json.loads(u['exchanges'])
+                        except: allowed = []
+                        if ex in allowed: intervals_needed.add(u['interval'])
+
                     if not intervals_needed: continue
 
                     for mins in intervals_needed:
@@ -107,13 +104,18 @@ class MarketEngine:
                                  min_diff = diff
                                  closest_ts = ts
                         
-                        if not closest_ts or min_diff > 45: continue
+                        if not closest_ts or min_diff > 60: continue
 
                         old_price = history[closest_ts]
                         pct_change = ((curr_price - old_price) / old_price) * 100
                         
                         for user in users:
-                            if user.get('active_exchange') != ex: continue
+                            # 1. Биржа
+                            try: allowed = json.loads(user['exchanges'])
+                            except: allowed = []
+                            if ex not in allowed: continue
+
+                            # 2. Параметры
                             if user['interval'] != mins: continue
                             if abs(pct_change) < user['threshold']: continue
 
@@ -129,27 +131,45 @@ class MarketEngine:
             self.clean_buffer()
             await asyncio.sleep(max(1.0, 5.0 - (datetime.now() - loop_start).total_seconds()))
 
-    async def calculate_technicals(self, exchange_name, symbol, price):
+    async def calculate_technicals(self, exchange_name, symbol, price, user_settings):
         exchange = self.exchanges[exchange_name]
         try:
-            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe='5m', limit=20)
+            # RSI с учетом таймфрейма юзера!
+            rsi_tf = user_settings.get('rsi_timeframe', '5m')
+            rsi_period = user_settings.get('rsi_period', 14)
+            
+            # Берем чуть больше свечей, чтобы хватило на расчет
+            limit = rsi_period + 10
+            
+            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=rsi_tf, limit=limit)
             df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
             close = df['close'].to_numpy()
+            
             delta = np.diff(close)
             gain = np.where(delta > 0, delta, 0)
             loss = np.where(delta < 0, -delta, 0)
-            avg_gain = np.mean(gain[-14:])
-            avg_loss = np.mean(loss[-14:])
-            rsi = 100 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss)))
+            
+            # Simple RSI calc
+            avg_gain = np.mean(gain[-rsi_period:])
+            avg_loss = np.mean(loss[-rsi_period:])
+            
+            if avg_loss == 0:
+                rsi = 100
+            else:
+                rs = avg_gain / avg_loss
+                rsi = 100 - (100 / (1 + rs))
 
-            funding_str = "0%"
+            # Funding
+            funding_str = "0.00%"
             try:
                 fund = await exchange.fetch_funding_rate(symbol)
                 funding_str = f"{fund['fundingRate'] * 100:.4f}%"
             except: pass
             
+            # 24h & Vol
             ticker = await exchange.fetch_ticker(symbol)
             
+            # Imbalance
             imbalance_val = 0
             try:
                 ob = await exchange.fetch_order_book(symbol, limit=5)
@@ -170,68 +190,68 @@ class MarketEngine:
             return None
 
     async def process_alert(self, user, exchange, symbol, price, old_price, change, interval):
-        if user.get('active_exchange') != exchange: return 
+        # Двойной чек биржи
+        try:
+            if exchange not in json.loads(user['exchanges']): return
+        except: return
+        
         if abs(change) < user['threshold']: return
 
-        tech = await self.calculate_technicals(exchange, symbol, price)
+        # Передаем настройки юзера в калькулятор, чтобы взять правильный RSI TF
+        tech = await self.calculate_technicals(exchange, symbol, price, user)
         if not tech: return
 
+        # Фильтр Тренда 24ч
         if user['filter_24h_enabled']:
             if change > 0 and tech['change_24h'] < user['min_24h_growth']: return
 
+        # --- ГИБКИЙ RSI ФИЛЬТР ---
         if user['rsi_enabled']:
             rsi = tech['rsi']
+            
+            # Логика:
+            # При ПАМПЕ (+): Если RSI уже перегрет (выше pump_limit), сигнал не нужен (поздно заходить).
             if change > 0 and rsi > user['rsi_pump_limit']: return
+            
+            # При ДАМПЕ (-): Если RSI уже на дне (ниже dump_limit), сигнал не нужен (шортить поздно).
             if change < 0 and rsi < user['rsi_dump_limit']: return
 
-        # === НОВЫЙ ДИЗАЙН СИГНАЛА ===
+        # Сборка сообщения
         is_pump = change > 0
-        emoji_side = "⚡️" if is_pump else "🔻"
-        color_side = "🟢" if is_pump else "🔴"
-        action_text = "РОСТ ЦЕНЫ" if is_pump else "ПАДЕНИЕ ЦЕНЫ"
+        side_color = "🟢" if is_pump else "🔴"
+        action = "Рост цены" if is_pump else "Снижение цены"
         
         pair_clean = symbol.split('/')[0].replace(':USDT','')
-        pair_display = f"#{pair_clean}" if user['show_hashtag'] else pair_clean
+        pair_fmt = f"#{pair_clean}" if user['show_hashtag'] else pair_clean
         
-        # Шапка
         msg = [
-            f"{emoji_side} <b>{pair_display}</b> | {exchange.upper()} Futures",
-            f"{color_side} <b>{action_text}: {change:+.2f}%</b> (за {interval} мин)",
-            f"💵 Цена: <code>{old_price}</code> ➔ <code>{price}</code>",
-            "───────────────────"
+            f"{side_color} <b>{pair_fmt}</b> | {exchange.capitalize()}",
+            f"{action}: <b>{change:+.2f}%</b> ({interval} мин)",
+            f"Цена: {old_price} ➔ {price}",
+            "────────────────"
         ]
         
-        # Технические данные (компактно)
-        tech_lines = []
         if user['rsi_enabled']:
-            rsi_val = tech['rsi']
-            rsi_status = "Перекуплен" if rsi_val > 70 else "Перепродан" if rsi_val < 30 else "Нейтрально"
-            tech_lines.append(f"📊 RSI (5m): <b>{rsi_val}</b> ({rsi_status})")
+            # Показываем TF, на котором считали
+            tf_icon = user.get('rsi_timeframe', '5m')
+            msg.append(f"RSI ({tf_icon}): <b>{tech['rsi']}</b>")
         
         if user['show_vol24']:
-            # Красивый вывод объема с динамикой
-            tech_lines.append(f"💰 Объем 24ч: <b>{tech['vol_24h']}</b> ({tech['change_24h']:+.1f}%)")
+            msg.append(f"Vol 24h: {tech['vol_24h']} (Изм. {tech['change_24h']:+.1f}%)")
             
         if user['show_imbalance']:
-            imb = tech['imbalance_pct']
-            imb_txt = f"Покупатели +{imb:.1f}%" if imb > 0 else f"Продавцы +{abs(imb):.1f}%"
-            side_dot = "🟢" if imb > 0 else "🔴"
-            tech_lines.append(f"⚖️ Стакан: {side_dot} {imb_txt}")
+            arrow = "↑" if tech['imbalance_pct'] > 0 else "↓"
+            msg.append(f"Стакан: {arrow} {abs(tech['imbalance_pct']):.1f}% (Bid/Ask)")
             
         if user['show_funding']:
-            tech_lines.append(f"🧩 Фандинг: {tech['funding']}")
-        
-        if tech_lines:
-            msg.extend(tech_lines)
-            msg.append("───────────────────")
-        
-        # Подвал
-        msg.append(f"📡 ID: {int(datetime.now().timestamp())}") # Уникальность сообщения
+            msg.append(f"Funding: {tech['funding']}")
+            
+        msg.append("────────────────")
         
         try:
             await self.bot.send_message(user['user_id'], "\n".join(msg), parse_mode="HTML")
         except Exception as e:
-            logger.error(f"Ошибка отправки: {e}")
+            logger.error(f"Delivery failed: {e}")
 
 async def run_screener(bot):
     engine = MarketEngine(bot)
