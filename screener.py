@@ -19,15 +19,11 @@ class MarketEngine:
         self.running = True
     
     async def init_exchanges(self):
-        options = {
-            'enableRateLimit': True, 
-            'options': {'defaultType': 'future'},
-            'timeout': 30000 
-        }
+        options = {'enableRateLimit': True, 'options': {'defaultType': 'future'}, 'timeout': 30000}
         self.exchanges['binance'] = ccxt.binance(options)
         self.exchanges['bybit'] = ccxt.bybit(options)
         self.exchanges['mexc'] = ccxt.mexc(options)
-        logger.info("Core Systems Online.")
+        logger.info("Система готова.")
 
     async def close_exchanges(self):
         for name, exchange in self.exchanges.items():
@@ -37,10 +33,9 @@ class MarketEngine:
         try:
             exchange = self.exchanges[exchange_name]
             tickers = await exchange.fetch_tickers()
-            if not tickers: raise ValueError("No Data")
+            if not tickers: raise ValueError
             return exchange_name, tickers
-        except Exception:
-            return exchange_name, {}
+        except: return exchange_name, {}
 
     def clean_buffer(self):
         cutoff = datetime.now() - timedelta(minutes=BUFFER_RETENTION_MIN)
@@ -50,28 +45,23 @@ class MarketEngine:
                 if not PRICE_BUFFER[exc][sym]: del PRICE_BUFFER[exc][sym]
 
     async def process_market_data(self):
-        logger.info("Market Monitor Active.")
-        
+        logger.info("Мониторинг запущен.")
         while self.running:
             loop_start = datetime.now()
-            
             try:
                 results = await asyncio.gather(*[self.fetch_tickers_safe(name) for name in self.exchanges])
-            except Exception:
+            except:
                 await asyncio.sleep(5)
                 continue
 
             for exchange_name, tickers in results:
                 if not tickers: continue
                 if exchange_name not in PRICE_BUFFER: PRICE_BUFFER[exchange_name] = {}
-
                 for symbol, data in tickers.items():
                     if not symbol.endswith(':USDT') and '/USDT' not in symbol: continue
                     if any(x in symbol for x in ['USDC', 'DAI', 'BUSD', '_', 'PERP']): pass
-                    
                     price = data.get('last')
                     if not price: continue
-
                     if symbol not in PRICE_BUFFER[exchange_name]: PRICE_BUFFER[exchange_name][symbol] = {}
                     PRICE_BUFFER[exchange_name][symbol][loop_start] = price
 
@@ -83,7 +73,6 @@ class MarketEngine:
                     history = PRICE_BUFFER[ex][sym]
                     curr_price = history[loop_start]
                     
-                    # Оптимизация: собираем нужные интервалы
                     intervals_needed = set()
                     for u in users:
                         try: allowed = json.loads(u['exchanges'])
@@ -94,15 +83,12 @@ class MarketEngine:
 
                     for mins in intervals_needed:
                         target_time = loop_start - timedelta(minutes=mins)
-                        
                         closest_ts = None
                         min_diff = 999
                         recent_keys = list(history.keys())[-40:] 
                         for ts in recent_keys:
                              diff = abs((ts - target_time).total_seconds())
-                             if diff < min_diff:
-                                 min_diff = diff
-                                 closest_ts = ts
+                             if diff < min_diff: min_diff = diff; closest_ts = ts
                         
                         if not closest_ts or min_diff > 60: continue
 
@@ -110,12 +96,9 @@ class MarketEngine:
                         pct_change = ((curr_price - old_price) / old_price) * 100
                         
                         for user in users:
-                            # 1. Биржа
                             try: allowed = json.loads(user['exchanges'])
                             except: allowed = []
                             if ex not in allowed: continue
-
-                            # 2. Параметры
                             if user['interval'] != mins: continue
                             if abs(pct_change) < user['threshold']: continue
 
@@ -134,49 +117,32 @@ class MarketEngine:
     async def calculate_technicals(self, exchange_name, symbol, price, user_settings):
         exchange = self.exchanges[exchange_name]
         try:
-            # RSI с учетом таймфрейма юзера!
             rsi_tf = user_settings.get('rsi_timeframe', '5m')
             rsi_period = user_settings.get('rsi_period', 14)
-            
-            # Берем чуть больше свечей, чтобы хватило на расчет
-            limit = rsi_period + 10
-            
-            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=rsi_tf, limit=limit)
+            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=rsi_tf, limit=rsi_period + 10)
             df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
             close = df['close'].to_numpy()
-            
             delta = np.diff(close)
             gain = np.where(delta > 0, delta, 0)
             loss = np.where(delta < 0, -delta, 0)
-            
-            # Simple RSI calc
             avg_gain = np.mean(gain[-rsi_period:])
             avg_loss = np.mean(loss[-rsi_period:])
-            
-            if avg_loss == 0:
-                rsi = 100
-            else:
-                rs = avg_gain / avg_loss
-                rsi = 100 - (100 / (1 + rs))
+            rsi = 100 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss)))
 
-            # Funding
             funding_str = "0.00%"
             try:
                 fund = await exchange.fetch_funding_rate(symbol)
                 funding_str = f"{fund['fundingRate'] * 100:.4f}%"
             except: pass
             
-            # 24h & Vol
             ticker = await exchange.fetch_ticker(symbol)
             
-            # Imbalance
             imbalance_val = 0
             try:
                 ob = await exchange.fetch_order_book(symbol, limit=5)
                 bids = sum([x[1] for x in ob['bids']])
                 asks = sum([x[1] for x in ob['asks']])
-                if asks > 0:
-                    imbalance_val = ((bids - asks) / asks) * 100
+                if asks > 0: imbalance_val = ((bids - asks) / asks) * 100
             except: pass
 
             return {
@@ -186,37 +152,26 @@ class MarketEngine:
                 'vol_24h': f"${ticker.get('quoteVolume', 0)/1000000:.1f}M",
                 'change_24h': ticker.get('percentage', 0)
             }
-        except Exception:
-            return None
+        except: return None
 
     async def process_alert(self, user, exchange, symbol, price, old_price, change, interval):
-        # Двойной чек биржи
         try:
             if exchange not in json.loads(user['exchanges']): return
         except: return
         
         if abs(change) < user['threshold']: return
 
-        # Передаем настройки юзера в калькулятор, чтобы взять правильный RSI TF
         tech = await self.calculate_technicals(exchange, symbol, price, user)
         if not tech: return
 
-        # Фильтр Тренда 24ч
         if user['filter_24h_enabled']:
             if change > 0 and tech['change_24h'] < user['min_24h_growth']: return
 
-        # --- ГИБКИЙ RSI ФИЛЬТР ---
         if user['rsi_enabled']:
             rsi = tech['rsi']
-            
-            # Логика:
-            # При ПАМПЕ (+): Если RSI уже перегрет (выше pump_limit), сигнал не нужен (поздно заходить).
             if change > 0 and rsi > user['rsi_pump_limit']: return
-            
-            # При ДАМПЕ (-): Если RSI уже на дне (ниже dump_limit), сигнал не нужен (шортить поздно).
             if change < 0 and rsi < user['rsi_dump_limit']: return
 
-        # Сборка сообщения
         is_pump = change > 0
         side_color = "🟢" if is_pump else "🔴"
         action = "Рост цены" if is_pump else "Снижение цены"
@@ -232,19 +187,20 @@ class MarketEngine:
         ]
         
         if user['rsi_enabled']:
-            # Показываем TF, на котором считали
             tf_icon = user.get('rsi_timeframe', '5m')
             msg.append(f"RSI ({tf_icon}): <b>{tech['rsi']}</b>")
         
         if user['show_vol24']:
-            msg.append(f"Vol 24h: {tech['vol_24h']} (Изм. {tech['change_24h']:+.1f}%)")
+            # ТУТ ПЕРЕВЕЛ: Vol -> Объем 24ч
+            msg.append(f"Объем 24ч: {tech['vol_24h']} (Изм. {tech['change_24h']:+.1f}%)")
             
         if user['show_imbalance']:
             arrow = "↑" if tech['imbalance_pct'] > 0 else "↓"
             msg.append(f"Стакан: {arrow} {abs(tech['imbalance_pct']):.1f}% (Bid/Ask)")
             
         if user['show_funding']:
-            msg.append(f"Funding: {tech['funding']}")
+            # ТУТ ПЕРЕВЕЛ: Funding -> Фандинг
+            msg.append(f"Фандинг: {tech['funding']}")
             
         msg.append("────────────────")
         
@@ -256,9 +212,6 @@ class MarketEngine:
 async def run_screener(bot):
     engine = MarketEngine(bot)
     await engine.init_exchanges()
-    try:
-        await engine.process_market_data()
-    except asyncio.CancelledError:
-        pass
-    finally:
-        await engine.close_exchanges()
+    try: await engine.process_market_data()
+    except asyncio.CancelledError: pass
+    finally: await engine.close_exchanges()
